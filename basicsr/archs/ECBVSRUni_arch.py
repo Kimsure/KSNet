@@ -4,24 +4,22 @@ import torch.nn.functional as F
 import torchvision
 import warnings
 
-from basicsr.archs.arch_util import flow_warp
-from basicsr.archs.basicvsr_arch import ConvResidualBlocks
+from basicsr.archs.arch_util import ECBCD, flow_warp, make_layer, ResidualBlockNoBN
 from basicsr.archs.spynet_arch import SpyNet
 from basicsr.ops.dcn import ModulatedDeformConvPack
 from basicsr.utils.registry import ARCH_REGISTRY
 
 
 @ARCH_REGISTRY.register()
-class BasicVSRPlusPlus(nn.Module):
-    """BasicVSR++ network structure.
-
+class ECBVSRUni(nn.Module):
+    """ECBVSR network structure.
+    1. Unidirectional propagation with one branch.
+    2. ECBGrops and ESA rather than DWRFDB.
+    3. full pixelshuffle with Conv rather than simplified pixel shuffle without Conv.
     Support either x4 upsampling or same size output. Since DCN is used in this
     model, it can only be used with CUDA enabled. If CUDA is not enabled,
     feature alignment will be skipped. Besides, we adopt the official DCN
     implementation and the version of torch need to be higher than 1.9.
-
-    ``Paper: BasicVSR++: Improving Video Super-Resolution with Enhanced Propagation and Alignment``
-
     Args:
         mid_channels (int, optional): Channel number of the intermediate
             features. Default: 64.
@@ -68,7 +66,7 @@ class BasicVSRPlusPlus(nn.Module):
         # propagation branches
         self.deform_align = nn.ModuleDict()
         self.backbone = nn.ModuleDict()
-        modules = ['backward_1', 'forward_1', 'backward_2', 'forward_2']
+        modules = ['backward_1', 'backward_2']
         for i, module in enumerate(modules):
             if torch.cuda.is_available():
                 self.deform_align[module] = SecondOrderDeformableAlignment(
@@ -78,25 +76,25 @@ class BasicVSRPlusPlus(nn.Module):
                     padding=1,
                     deformable_groups=16,
                     max_residue_magnitude=max_residue_magnitude)
-            self.backbone[module] = ConvResidualBlocks((2 + i) * mid_channels, mid_channels, num_blocks)
+            # DWResidualBlockNoBN((2 + i) * mid_channels, mid_channels)
+            self.backbone[module] = ECBCD((2 + i) * mid_channels, mid_channels)
 
         # upsampling module
-        self.reconstruction = ConvResidualBlocks(5 * mid_channels, mid_channels, 5)
+        self.reconstruction = ConvResidualBlocks(3*mid_channels, mid_channels, 1)
+        # self.upconv1 = nn.Conv2d(mid_channels, mid_channels * 4, 3, 1, 1, bias=True)
+        # self.upconv2 = nn.Conv2d(mid_channels, 64 * 4, 3, 1, 1, bias=True)
+        self.upconv = nn.Conv2d(mid_channels, mid_channels * 16, kernel_size = 1, stride = 1, padding = 0, bias=True)
 
-        self.upconv1 = nn.Conv2d(mid_channels, mid_channels * 4, 3, 1, 1, bias=True)
-        self.upconv2 = nn.Conv2d(mid_channels, 64 * 4, 3, 1, 1, bias=True)
+        self.pixel_shuffle = nn.PixelShuffle(4)
 
-        self.pixel_shuffle = nn.PixelShuffle(2)
-
-        self.conv_hr = nn.Conv2d(64, 64, 3, 1, 1)
-        self.conv_last = nn.Conv2d(64, 3, 3, 1, 1)
+        self.conv_last = nn.Conv2d(mid_channels, 3, 3, 1, 1)
         self.img_upsample = nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
 
         # activation function
         self.lrelu = nn.LeakyReLU(negative_slope=0.1, inplace=True)
 
         # check if the sequence is augmented by flipping
-        self.is_mirror_extended = False
+        self.is_mirror_extended = True
 
         if len(self.deform_align) > 0:
             self.is_with_alignment = True
@@ -107,12 +105,13 @@ class BasicVSRPlusPlus(nn.Module):
                           'be used with CUDA enabled. Alignment is skipped now.')
 
     def check_if_mirror_extended(self, lqs):
-        """Check whether the input is a mirror-extended sequence.
-
-        If mirror-extended, the i-th (i=0, ..., t-1) frame is equal to the (t-1-i)-th frame.
-
+        """
+        Check whether the input is a mirror-extended sequence.
+        If mirror-extended, the i-th (i=0, ..., t-1) frame is equal to the
+        (t-1-i)-th frame.
         Args:
-            lqs (tensor): Input low quality (LQ) sequence with shape (n, t, c, h, w).
+            lqs (tensor): Input low quality (LQ) sequence with
+                shape (n, t, c, h, w).
         """
 
         if lqs.size(1) % 2 == 0:
@@ -121,19 +120,18 @@ class BasicVSRPlusPlus(nn.Module):
                 self.is_mirror_extended = True
 
     def compute_flow(self, lqs):
-        """Compute optical flow using SPyNet for feature alignment.
-
+        """
+        Compute optical flow using SPyNet for feature alignment.
         Note that if the input is an mirror-extended sequence, 'flows_forward'
         is not needed, since it is equal to 'flows_backward.flip(1)'.
-
         Args:
             lqs (tensor): Input low quality (LQ) sequence with
                 shape (n, t, c, h, w).
-
         Return:
-            tuple(Tensor): Optical flow. 'flows_forward' corresponds to the flows used for forward-time propagation \
-                (current to previous). 'flows_backward' corresponds to the flows used for backward-time \
-                propagation (current to next).
+            tuple(Tensor): Optical flow. 'flows_forward' corresponds to the
+                flows used for forward-time propagation (current to previous).
+                'flows_backward' corresponds to the flows used for
+                backward-time propagation (current to next).
         """
 
         n, t, c, h, w = lqs.size()
@@ -155,17 +153,15 @@ class BasicVSRPlusPlus(nn.Module):
 
     def propagate(self, feats, flows, module_name):
         """Propagate the latent features throughout the sequence.
-
         Args:
             feats dict(list[tensor]): Features from previous branches. Each
                 component is a list of tensors with shape (n, c, h, w).
             flows (tensor): Optical flows with shape (n, t - 1, 2, h, w).
             module_name (str): The name of the propgation branches. Can either
                 be 'backward_1', 'forward_1', 'backward_2', 'forward_2'.
-
         Return:
-            dict(list[tensor]): A dictionary containing all the propagated \
-                features. Each key in the dictionary corresponds to a \
+            dict(list[tensor]): A dictionary containing all the propagated
+                features. Each key in the dictionary corresponds to a
                 propagation branch, which is represented by a list of tensors.
         """
 
@@ -236,12 +232,10 @@ class BasicVSRPlusPlus(nn.Module):
 
     def upsample(self, lqs, feats):
         """Compute the output image given the features.
-
         Args:
             lqs (tensor): Input low quality (LQ) sequence with
                 shape (n, t, c, h, w).
-            feats (dict): The features from the propagation branches.
-
+            feats (dict): The features from the propgation branches.
         Returns:
             Tensor: Output HR sequence with shape (n, t, c, 4h, 4w).
         """
@@ -260,9 +254,7 @@ class BasicVSRPlusPlus(nn.Module):
                 hr = hr.cuda()
 
             hr = self.reconstruction(hr)
-            hr = self.lrelu(self.pixel_shuffle(self.upconv1(hr)))
-            hr = self.lrelu(self.pixel_shuffle(self.upconv2(hr)))
-            hr = self.lrelu(self.conv_hr(hr))
+            hr = self.lrelu(self.pixel_shuffle(self.upconv(hr)))
             hr = self.conv_last(hr)
             if self.is_low_res_input:
                 hr += self.img_upsample(lqs[:, i, :, :, :])
@@ -279,17 +271,15 @@ class BasicVSRPlusPlus(nn.Module):
 
     def forward(self, lqs):
         """Forward function for BasicVSR++.
-
         Args:
             lqs (tensor): Input low quality (LQ) sequence with
                 shape (n, t, c, h, w).
-
         Returns:
             Tensor: Output HR sequence with shape (n, t, c, 4h, 4w).
         """
 
         n, t, c, h, w = lqs.size()
-
+        # print(lqs.size())
         # whether to cache the features in CPU
         self.cpu_cache = True if t > self.cpu_cache_length else False
 
@@ -324,7 +314,7 @@ class BasicVSRPlusPlus(nn.Module):
 
         # feature propgation
         for iter_ in [1, 2]:
-            for direction in ['backward', 'forward']:
+            for direction in ['backward']:
                 module = f'{direction}_{iter_}'
 
                 feats[module] = []
@@ -346,7 +336,6 @@ class BasicVSRPlusPlus(nn.Module):
 
 class SecondOrderDeformableAlignment(ModulatedDeformConvPack):
     """Second-order deformable alignment module.
-
     Args:
         in_channels (int): Same as nn.Conv2d.
         out_channels (int): Same as nn.Conv2d.
@@ -406,12 +395,62 @@ class SecondOrderDeformableAlignment(ModulatedDeformConvPack):
 
         return torchvision.ops.deform_conv2d(x, offset, self.weight, self.bias, self.stride, self.padding,
                                              self.dilation, mask)
+        
+class ConvResidualBlocks(nn.Module):
+    """Conv and residual block used in BasicVSR.
+
+    Args:
+        num_in_ch (int): Number of input channels. Default: 3.
+        num_out_ch (int): Number of output channels. Default: 64.
+        num_block (int): Number of residual blocks. Default: 15.
+    """
+
+    def __init__(self, num_in_ch=3, num_out_ch=64, num_block=15):
+        super().__init__()
+        self.main = nn.Sequential(
+            nn.Conv2d(num_in_ch, num_out_ch, 3, 1, 1, bias=True), nn.LeakyReLU(negative_slope=0.1, inplace=True),
+            make_layer(ResidualBlockNoBN, num_block, num_feat=num_out_ch))
+
+    def forward(self, fea):
+        return self.main(fea)
 
 
-# if __name__ == '__main__':
-#     spynet_path = 'experiments/pretrained_models/flownet/spynet_sintel_final-3d2a1287.pth'
-#     model = BasicVSRPlusPlus(spynet_path=spynet_path).cuda()
-#     input = torch.rand(1, 2, 3, 64, 64).cuda()
-#     output = model(input)
-#     print('===================')
-#     print(output.shape)
+# from param_util import get_model_flops, get_model_activation
+from ptflops.flops_counter import get_model_complexity_info
+if __name__ == '__main__':
+    spynet_path = '../../experiments/pretrained_models/flowNet/spynet_sintel_final-3d2a1287.pth'
+    model = ECBVSR(spynet_path=spynet_path).cuda()
+    input = torch.rand(1, 2, 3, 64, 64).cuda()
+    output = model(input)
+    print('===================')
+    print(output.shape)
+    print('===================')
+    flops, params = get_model_complexity_info(model, (2, 3, 180, 320), as_strings=True, print_per_layer_stat=True, verbose=True)
+    print('{:<30}  {:<8}'.format('Computational complexity: ', flops))
+    print('{:<30}  {:<8}'.format('Number of parameters: ', params))
+
+    import time
+
+    t = 10
+    repeat_time = 10
+    warm_up = 5
+    infer_time = 0
+
+    model.eval()
+    with torch.no_grad():
+        x = torch.rand(1, t, 3, 180, 320).cuda()
+
+        for i in range(repeat_time):
+            if i < warm_up:
+                infer_time = 0
+            torch.cuda.synchronize()
+            start_time = time.time()
+            y = model(x)
+            torch.cuda.synchronize()
+            end_time = time.time()
+            infer_time += (end_time - start_time)
+
+
+    print(y.shape, infer_time / (repeat_time - warm_up + 1) / t)
+
+
