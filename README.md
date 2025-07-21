@@ -4,10 +4,11 @@ Sincerely sorry for the unavailable code that was lost due to a server issue at 
 
 ## TODOs
 
-- [x] Build baseline based on [BasicSR](https://github.com/XPixelGroup/BasicSR)  
-- [ ] Clean unrelated code  
-- [ ] Implement kernel split module  
-- [ ] Implement flow-guided DCN module  
+- [x] Build baseline based on [BasicSR](https://github.com/XPixelGroup/BasicSR)   
+- [x] Implement kernel split module  
+- [x] Implement flow-guided DCN module
+- [ ] Clean unrelated code
+- [ ] Write clear instructions
 
 ## Citation
 
