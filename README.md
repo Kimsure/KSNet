@@ -1,6 +1,46 @@
 # KSNet-for-VSR
 
-Sincerely sorry for the unavailable code that was lost due to a server issue at the university. I'll try to reimplement and release it later this year.
+
+The repository contains the official implementation of "Kernel Dimension Matters: to Activate Avaliable Kernels for Real-time Video Super-resolution"
+
+# Introduction
+
+We have updated the core implementation of KSNet. To start up, you can follow the instructions from [BasicSR](https://github.com/XPixelGroup/BasicSR). More detailed introduction will be updated in a few weeks.
+
+[paper](https://dl.acm.org/doi/abs/10.1145/3581783.3611908)
+
+## Installation
+
+Please follow [installation guide.](https://github.com/XPixelGroup/BasicSR/blob/master/docs/INSTALL.md)
+
+## Data Preparation
+
+Please follow [Dataset preparation.](https://github.com/XPixelGroup/BasicSR/blob/master/docs/DatasetPreparation.md)
+
+## Usage
+
+Training Commands
+
+Single GPU Training
+
+```
+PYTHONPATH="./:${PYTHONPATH}" \
+CUDA_VISIBLE_DEVICES=0 \
+python basicsr/train.py -opt options/train/SRResNet_SRGAN/train_MSRResNet_x4.yml
+```
+
+Distributed Training
+```
+PYTHONPATH="./:${PYTHONPATH}" \
+CUDA_VISIBLE_DEVICES={GPU device id} \
+python -m torch.distributed.launch --nproc_per_node={GPU device number} --master_port=4321 basicsr/train.py options/train/ECBVSR/train_ECBVSR_REDS.yml --launcher pytorch
+```
+or
+```
+CUDA_VISIBLE_DEVICES={GPU device id} \
+./scripts/dist_train.sh {GPU device number} options/train/ECBVSR/train_ECBVSR_REDS.yml
+```
+
 
 ## TODOs
 
